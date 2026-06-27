@@ -2,6 +2,7 @@ package lz4
 
 import (
 	"io"
+	"sync"
 
 	"github.com/cwbudde/lz4/internal/lz4block"
 	"github.com/cwbudde/lz4/internal/lz4errors"
@@ -36,6 +37,8 @@ type Writer struct {
 	idx     int                       // size of pending data
 	handler func(int)
 	legacy  bool
+	jobs    chan writerCompressJob
+	workers sync.WaitGroup
 }
 
 func (*Writer) private() {}
@@ -65,10 +68,53 @@ func (w *Writer) isNotConcurrent() bool {
 // init sets up the Writer when in newState. It does not change the Writer state.
 func (w *Writer) init() error {
 	w.frame.InitW(w.src, w.num, w.legacy)
+	w.initWorkers()
 	size := w.frame.Descriptor.Flags.BlockSizeIndex()
 	w.data = size.Get()
 	w.idx = 0
 	return w.frame.Descriptor.Write(w.frame, w.src)
+}
+
+type writerCompressJob struct {
+	c    chan *lz4stream.FrameDataBlock
+	data []byte
+	safe bool
+}
+
+func (w *Writer) initWorkers() {
+	if w.isNotConcurrent() {
+		return
+	}
+	frame := w.frame
+	level := w.level
+	handler := w.handler
+	jobs := make(chan writerCompressJob, w.num)
+	w.jobs = jobs
+	w.workers.Add(w.num)
+	for i := 0; i < w.num; i++ {
+		go func() {
+			defer w.workers.Done()
+			for job := range jobs {
+				b := lz4stream.NewFrameDataBlock(frame)
+				job.c <- b.Compress(frame, job.data, level)
+				<-job.c
+				handler(len(b.Data))
+				b.Close(frame)
+				if job.safe {
+					lz4block.Put(job.data)
+				}
+			}
+		}()
+	}
+}
+
+func (w *Writer) closeWorkers() {
+	if w.jobs == nil {
+		return
+	}
+	close(w.jobs)
+	w.workers.Wait()
+	w.jobs = nil
 }
 
 func (w *Writer) Write(buf []byte) (n int, err error) {
@@ -129,17 +175,7 @@ func (w *Writer) write(data []byte, safe bool) error {
 	}
 	c := make(chan *lz4stream.FrameDataBlock)
 	w.frame.Blocks.Blocks <- c
-	go func(c chan *lz4stream.FrameDataBlock, data []byte, safe bool) {
-		b := lz4stream.NewFrameDataBlock(w.frame)
-		c <- b.Compress(w.frame, data, w.level)
-		<-c
-		w.handler(len(b.Data))
-		b.Close(w.frame)
-		if safe {
-			// safe to put it back as the last usage of it was FrameDataBlock.Write() called before c is closed
-			lz4block.Put(data)
-		}
-	}(c, data, safe)
+	w.jobs <- writerCompressJob{c: c, data: data, safe: safe}
 
 	return nil
 }
@@ -175,6 +211,7 @@ func (w *Writer) Close() error {
 		return err
 	}
 	err := w.frame.CloseW(w.src, w.num)
+	w.closeWorkers()
 	// It is now safe to free the buffer.
 	lz4block.Put(w.data)
 	w.data = nil
@@ -191,6 +228,7 @@ func (w *Writer) Reset(writer io.Writer) {
 	lz4block.Put(w.data)
 	w.data = nil
 	w.frame.Reset(w.num)
+	w.closeWorkers()
 	w.state.reset()
 	w.src = writer
 }
@@ -232,7 +270,6 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 			if err != nil {
 				return
 			}
-			w.handler(rn)
 		}
 		if !done && !w.isNotConcurrent() {
 			// The buffer will be returned automatically by go routines (safe=true)

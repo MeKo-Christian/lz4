@@ -71,12 +71,13 @@
 **Files:** `internal/lz4stream/block.go`, `writer.go`, `reader.go`, `bench_test.go`
 
 - [x] Measure concurrent encode/decode with large blocks and multiple cores after Tasks 1-3.
-- [ ] If scheduler overhead shows up, replace per-block goroutine creation with a reusable worker pool.
-- [ ] If profiles justify it, replace nested channel orchestration with cheaper job/result queues.
+- [x] Replace writer-side per-block compression goroutine creation with a reusable worker pool.
+- [x] Evaluate reader-side worker pooling; defer because the prototype regressed concurrent decompression.
+- [x] Evaluate nested channel orchestration; defer replacement because profiles/benchmarks do not justify the broader rewrite.
 - [x] Preserve ordered output and first-error semantics.
 - [x] Re-check memory retention and buffer-pool behavior.
 
-**Task 4 note:** Fixed a concurrent writer reuse deadlock where `Reset` tried to close an already-drained concurrent block manager. Benchmarks now complete for concurrent frame compression. Current `benchmem`/profile results show higher allocation cost in concurrent paths, especially decompression, but not enough evidence for a broad worker-pool/channel rewrite in this pass.
+**Task 4 note:** Fixed a concurrent writer reuse deadlock where `Reset` tried to close an already-drained concurrent block manager. Concurrent frame compression now uses a bounded worker pool instead of one goroutine per block, and `Writer.ReadFrom` no longer double-calls `OnBlockDone`. Reader-side worker pooling was prototyped and reverted because it slowed concurrent decompression; current `benchmem`/profile results still show high reader allocations, but not enough evidence for a broader channel orchestration rewrite in this pass.
 
 **Success criteria:** Better throughput for `ConcurrencyOption(n>1)` without higher allocations or single-threaded regressions.
 

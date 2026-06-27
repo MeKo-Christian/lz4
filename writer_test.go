@@ -134,6 +134,41 @@ func TestWriterConcurrentMultipleBlocksCompletes(t *testing.T) {
 	}
 }
 
+func TestWriterConcurrentReadFromReportsEachBlockOnce(t *testing.T) {
+	raw, err := loadGoldenGz("testdata/pg1661.txt.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int
+	var compressed bytes.Buffer
+	zw := lz4.NewWriter(&compressed)
+	if err := zw.Apply(
+		lz4.BlockSizeOption(lz4.Block64Kb),
+		lz4.ConcurrencyOption(4),
+		lz4.OnBlockDoneOption(func(int) { calls++ }),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := zw.ReadFrom(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(raw)) {
+		t.Fatalf("ReadFrom byte count: got %d, want %d", n, len(raw))
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	blockSize := int(lz4.Block64Kb)
+	wantCalls := (len(raw) + blockSize - 1) / blockSize
+	if calls != wantCalls {
+		t.Fatalf("OnBlockDone calls: got %d, want %d", calls, wantCalls)
+	}
+}
+
 func TestWriter_Reset(t *testing.T) {
 	data := pg1661
 	buf := new(bytes.Buffer)
