@@ -75,6 +75,7 @@ var (
 	pg1661FrameConcurrent  = mustCompressFrame(pg1661, lz4.BlockSizeOption(lz4.Block64Kb))
 	digitsFrameChecksumOn  = mustCompressFrame(digits)
 	twainFrameChecksumOn   = mustCompressFrame(twain)
+	twainFrameConcurrent   = mustCompressFrame(twain, lz4.BlockSizeOption(lz4.Block64Kb))
 	randomFrameChecksumOn  = mustCompressFrame(random)
 )
 
@@ -189,8 +190,17 @@ func BenchmarkFrameDecompress(b *testing.B) {
 	b.Run("Pg1661ChecksumOff", func(b *testing.B) {
 		benchmarkFrameDecompress(b, pg1661FrameChecksumOff)
 	})
+	b.Run("Pg1661Single", func(b *testing.B) {
+		benchmarkFrameDecompress(b, pg1661FrameConcurrent, lz4.ConcurrencyOption(1))
+	})
 	b.Run("Pg1661Concurrent", func(b *testing.B) {
 		benchmarkFrameDecompress(b, pg1661FrameConcurrent, lz4.ConcurrencyOption(runtime.GOMAXPROCS(0)))
+	})
+	b.Run("TwainSingle", func(b *testing.B) {
+		benchmarkFrameDecompress(b, twainFrameConcurrent, lz4.ConcurrencyOption(1))
+	})
+	b.Run("TwainConcurrent", func(b *testing.B) {
+		benchmarkFrameDecompress(b, twainFrameConcurrent, lz4.ConcurrencyOption(runtime.GOMAXPROCS(0)))
 	})
 	b.Run("DigitsChecksumOn", func(b *testing.B) {
 		benchmarkFrameDecompress(b, digitsFrameChecksumOn)
@@ -236,27 +246,6 @@ func benchmarkFrameCompress(b *testing.B, uncompressed []byte, options ...lz4.Op
 	}
 }
 
-func benchmarkFrameCompressFreshWriter(b *testing.B, uncompressed []byte, outbytes int, options ...lz4.Option) {
-	b.SetBytes(int64(len(uncompressed)))
-	b.ReportAllocs()
-	b.ReportMetric(float64(outbytes), "outbytes")
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		var w bytes.Buffer
-		zw := lz4.NewWriter(&w)
-		if err := zw.Apply(options...); err != nil {
-			b.Fatal(err)
-		}
-		if _, err := io.Copy(zw, bytes.NewReader(uncompressed)); err != nil {
-			b.Fatal(err)
-		}
-		if err := zw.Close(); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 func BenchmarkFrameCompress(b *testing.B) {
 	b.Run("Pg1661ChecksumOn", func(b *testing.B) {
 		benchmarkFrameCompress(b, pg1661)
@@ -264,11 +253,26 @@ func BenchmarkFrameCompress(b *testing.B) {
 	b.Run("Pg1661ChecksumOff", func(b *testing.B) {
 		benchmarkFrameCompress(b, pg1661, lz4.ChecksumOption(false))
 	})
+	b.Run("Pg1661Single", func(b *testing.B) {
+		benchmarkFrameCompress(b, pg1661,
+			lz4.BlockSizeOption(lz4.Block64Kb),
+			lz4.ConcurrencyOption(1),
+		)
+	})
 	b.Run("Pg1661Concurrent", func(b *testing.B) {
-		benchmarkFrameCompressFreshWriter(
-			b,
-			pg1661,
-			len(pg1661FrameConcurrent),
+		benchmarkFrameCompress(b, pg1661,
+			lz4.BlockSizeOption(lz4.Block64Kb),
+			lz4.ConcurrencyOption(runtime.GOMAXPROCS(0)),
+		)
+	})
+	b.Run("TwainSingle", func(b *testing.B) {
+		benchmarkFrameCompress(b, twain,
+			lz4.BlockSizeOption(lz4.Block64Kb),
+			lz4.ConcurrencyOption(1),
+		)
+	})
+	b.Run("TwainConcurrent", func(b *testing.B) {
+		benchmarkFrameCompress(b, twain,
 			lz4.BlockSizeOption(lz4.Block64Kb),
 			lz4.ConcurrencyOption(runtime.GOMAXPROCS(0)),
 		)

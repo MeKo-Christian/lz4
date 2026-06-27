@@ -1,250 +1,109 @@
-# LZ4 Performance Implementation Plan
+# LZ4 Performance Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Agent note:** Implement task-by-task with `superpowers:subagent-driven-development` or `superpowers:executing-plans`. Track progress with the checkboxes below.
 
-**Goal:** Increase real-world compression and decompression throughput in this repo without breaking the LZ4 block/frame format or correctness guarantees.
+**Goal:** Improve real-world LZ4 compression/decompression throughput without changing block/frame format semantics or correctness guarantees.
 
-**Architecture:** Treat performance work as three separate layers: benchmark fidelity, core block codec speed, and stream/frame overhead. Fix the measurement harness first, then optimize the fast block compressor in Go, then add targeted `asm` only where profiles show stable wins, especially for checksum-heavy frame workloads.
+**Approach:** Keep the work evidence-driven: fix benchmarks first, optimize the Go block compressor, add narrow assembly only where profiles prove it helps, then revisit stream overhead.
 
-**Tech Stack:** Go, Go testing/benchmarking, `pprof`, Plan 9 assembly, existing `internal/lz4block`, `internal/lz4stream`, and `internal/xxh32` packages.
+## Current Findings
 
----
+- The fast block compressor is the main Go-side hotspot. Prior profiles point at hash-table probing/bookkeeping and repeated little-endian loads in `internal/lz4block.(*Compressor).CompressBlock`.
+- Existing `amd64` decode assembly is already valuable: `BenchmarkUncompressPg1661` was about `291 us/op` with assembly vs `856 us/op` with `-tags noasm`.
+- Checksum work is a major frame-decode cost after decode assembly, with `internal/xxh32.updateGo` previously around one quarter of stream decode CPU time.
+- Benchmark fidelity needed repair: one decode benchmark used a framed `.lz4` file as a raw block, and stream-compress benchmarks did not reset the backing buffer.
+- Stream concurrency may have overhead from per-block goroutines/channels, but it should be measured after the codec/checksum work.
 
-## Bottleneck Analysis
+## Optimization Order
 
-### What was measured
-
-- `go test -run '^$' -bench 'Benchmark(Compress|Uncompress)' -benchmem`
-- `go test ./internal/lz4block -run '^$' -bench '.' -benchmem`
-- `go test -run '^$' -bench '^BenchmarkCompressPg1661$' -cpuprofile /tmp/lz4-compress.prof`
-- `go test -run '^$' -bench '^BenchmarkUncompressPg1661$' -cpuprofile /tmp/lz4-uncompress.prof`
-- `go tool pprof -top /tmp/lz4-compress.prof`
-- `go tool pprof -top /tmp/lz4-uncompress.prof`
-- `go test -tags noasm -run '^$' -bench '^BenchmarkUncompressPg1661$' -benchmem`
-
-### Current findings
-
-1. The fast block compressor is the main Go-side hotspot.
-   - `BenchmarkCompress`: about `5.36 ms/op` on `pg1661`.
-   - Block-only CPU profile is almost entirely in `internal/lz4block.(*Compressor).CompressBlock`.
-   - Within that profile:
-     - `(*Compressor).get`: about `26%`
-     - `(*Compressor).put`: about `10%`
-     - `binary.LittleEndian.Uint32/Uint64`: about `12%`
-     - `blockHash`: about `5%`
-   - Interpretation: the compression hot loop is dominated by hash-table probing, position bookkeeping, and repeated little-endian loads. That is where most Go-side wins are likely to come from.
-
-2. Existing `amd64` decoder assembly is already valuable.
-   - `BenchmarkUncompressPg1661`: about `291,679 ns/op`
-   - `BenchmarkUncompressPg1661` with `-tags noasm`: about `856,407 ns/op`
-   - Interpretation: current decode assembly is worth roughly a `2.9x` speedup on this stream workload. Decoder `asm` is already paying for itself.
-
-3. Frame checksums are a major secondary cost on stream decompression.
-   - Stream decode profile:
-     - `internal/lz4block.decodeBlock`: about `59%`
-     - `internal/xxh32.updateGo`: about `27.5%`
-     - `runtime.memmove`: about `10.6%`
-   - Interpretation: once decode is assembly-backed, checksum work becomes one of the next largest frame-level costs, especially on `amd64` where `xxh32` is still Go code.
-
-4. Some existing benchmarks are not trustworthy enough to guide optimization work.
-   - `bench_test.go:61-69` calls `lz4block.UncompressBlock(pg1661LZ4, buf, nil)`, but `testdata/pg1661.txt.lz4` starts with `0x184D2204`, which is the frame magic, not a raw block.
-   - `bench_test.go:143-147` resets the `Writer` but does not reset the underlying `bytes.Buffer`, so stream-compress benchmarks are polluted by buffer growth and append behavior.
-   - Interpretation: measurement cleanup is the first task, otherwise later wins will be hard to trust.
-
-5. Stream concurrency likely has overhead worth revisiting, but it is not the first thing to optimize.
-   - `internal/lz4stream/block.go:21-57` and `:95-180` create goroutines and per-block channels in the concurrent path.
-   - This is likely fine for large blocks and high latency I/O, but it adds scheduling and allocation pressure for CPU-bound microbenchmarks.
-
-## Brainstorming: Where Speedups Are Most Likely
-
-### High-confidence wins
-
-- Fix the benchmark harness first so the numbers reflect actual work.
-- Add `amd64` and `arm64` `xxh32` assembly. The profile already shows checksum cost is material on stream decode.
-- Tune the fast compressor hot loop in Go before attempting compressor assembly.
-- Add explicit benchmarks for checksum-enabled vs checksum-disabled frame workloads.
-
-### Plausible wins
-
-- Rework the fast compressor hash-table layout to reduce `get`/`put` overhead.
-- Use lower-overhead loads and fewer repeated bounds checks in `internal/lz4block/block.go`.
-- Add an earlier incompressible-data bailout to avoid spending too much time hashing data that will be emitted raw anyway.
-- Replace per-block goroutine/channel orchestration with a worker pool for concurrent frame encode/decode.
-
-### Low-confidence or high-risk ideas
-
-- Write Plan 9 assembly for the fast compressor.
-- Further tune decoder assembly thresholds in `internal/lz4block/decode_amd64.s`.
-- Use wider SIMD-heavy copy/match logic in the encoder.
-
-These are real options, but they should come after the measurement cleanup and Go-level compressor work. The encoder profile says the current bottleneck is mostly table/index logic, not something obviously fixed by hand-written copy loops alone.
-
-## Recommended Optimization Order
-
-1. Repair and expand the benchmark/profiling harness.
+1. Repair and expand benchmarks/profiling.
 2. Optimize the fast block compressor in pure Go.
-3. Add missing checksum assembly for `amd64` and possibly `arm64`.
-4. Re-measure frame encode/decode with checksums on and off.
+3. Add checksum assembly for `amd64`; consider `arm64` only after measuring impact.
+4. Re-measure frame paths with checksums on/off.
 5. Revisit stream concurrency overhead.
-6. Only then decide whether encoder `asm` is justified.
+6. Decide whether any additional assembly is justified.
 
-## Where Plan 9 Assembly Can Help
+## Completed Work
 
-### Good assembly candidates
+### Task 1: Benchmark Fidelity
 
-- `internal/xxh32`
-  - There is ARM assembly already, but no `amd64` or `arm64` fast path.
-  - This is a clean, self-contained target with stable semantics and a clear profile signal.
-  - Expected impact: medium to high for checksum-enabled frame workloads.
+**Files:** `bench_test.go`, optional `internal/lz4block/bench_test.go`
 
-- `internal/lz4block/decode_amd64.s`
-  - Decoder assembly already exists and is effective.
-  - The `TODO` threshold comments around `decode_amd64.s:365` and `:412` suggest some tuning work is still unfinished.
-  - Expected impact: low to medium unless new measurements show a specific missed fast path.
+- [x] Benchmark raw block decompression with a real raw block, not a framed `.lz4` file.
+- [x] Reset the backing `bytes.Buffer` in stream-compress benchmarks.
+- [x] Add checksum-on/off stream reader and writer benchmarks.
+- [x] Add concurrent frame encode/decode benchmarks using `ConcurrencyOption(runtime.GOMAXPROCS(0))`.
+- [x] Use names that distinguish block vs frame and checksum vs no-checksum paths.
+- [x] Capture baseline `go test -run '^$' -bench . -benchmem`.
+- [x] Capture baseline `go test -run '^$' -bench . -benchmem -tags noasm`.
+- [x] Save baseline numbers in a commit message or short benchmark note before hot-code changes.
 
-### Poor early assembly candidates
+### Task 2: Fast Go Compressor
 
-- `internal/lz4block/block.go` fast compressor
-  - The hot costs are mostly table lookups, hashing, and branchy match search logic.
-  - Assembly here would be harder to maintain, harder to fuzz, and harder to port than an `xxh32` port.
-  - Recommendation: optimize the Go implementation first and only consider `asm` if the post-Go profile still points at a tiny stable inner loop.
+**Files:** `internal/lz4block/block.go`, `internal/lz4block/block_test.go`, benchmarks
 
-## Other Tricks Worth Trying
+- [x] Profile repaired block-compress benchmarks and confirm the hot symbols.
+- [x] Simplify `get`/`put` overhead where possible.
+- [x] Benchmark single-entry table layout vs the existing table plus bitmap.
+- [x] Evaluate lower-overhead little-endian loads in the match scan.
+- [x] Test cheaper hash or `hashLog` changes without unacceptable ratio loss.
+- [x] Add and measure an early incompressible-block bailout.
+- [x] Verify format compatibility with block round-trip tests and fuzz-style corpora.
 
-- Table-layout experiments
-  - Replace the split `table` plus `inUse` layout with a single entry format if that reduces lookup overhead.
-  - Try storing absolute or tagged positions instead of reconstructing from 16-bit values plus a bitmap.
-  - Guard this with benchmarks because higher memory traffic could erase the win.
+**Success criteria:** Measurable block-compress improvement with no regressions in block tests, representative corpora, or compression ratio.
 
-- Load-path experiments
-  - Reduce repeated `binary.LittleEndian.Uint32/Uint64` calls in the hot loop.
-  - Evaluate `unsafe` loads only if they produce a clear win and keep the code easy to reason about.
+### Task 3: Checksum Assembly
 
-- Incompressible fast path
-  - Add a cheap sampling heuristic so obviously incompressible blocks bail out earlier.
-  - This is most relevant when the frame layer can emit raw blocks directly.
-
-- Stream write/read overhead
-  - Collapse small writes in frame encode if write aggregation reduces syscall or buffer churn.
-  - Replace per-block goroutines with a bounded worker pool and reusable job/result structs.
-
-- Benchmark matrix
-  - Add separate benchmarks for:
-    - raw block compress
-    - raw block decompress
-    - frame compress with checksum on
-    - frame compress with checksum off
-    - frame decompress with checksum on
-    - frame decompress with checksum off
-    - concurrent frame encode/decode
-    - `noasm` comparisons for decode and checksums
-
-## Task 1: Fix Measurement Fidelity
-
-**Files:**
-- Modify: `bench_test.go`
-- Create: `internal/lz4block/bench_test.go` or similar block-only benchmark file if needed
-
-- [x] Replace `BenchmarkUncompress` so it benchmarks a real raw block, not a framed `.lz4` test file.
-- [x] Reset the underlying `bytes.Buffer` in `benchmarkCompress` before each iteration.
-- [x] Add checksum-on and checksum-off stream benchmarks for both reader and writer paths.
-- [x] Add a benchmark that exercises concurrent frame compression and decompression with `ConcurrencyOption(runtime.GOMAXPROCS(0))`.
-- [x] Add benchmark names that clearly distinguish block-vs-frame and checksum-vs-no-checksum paths.
-- [x] Capture baseline results with:
-  - `go test -run '^$' -bench . -benchmem`
-  - `go test -run '^$' -bench . -benchmem -tags noasm`
-- [x] Save the baseline numbers in the commit message or a short benchmark note before changing hot code.
-
-**Why this task comes first:** the repo currently has at least one invalid decode benchmark and one skewed stream-compress benchmark. Optimization work without fixing those will create false positives.
-
-## Task 2: Optimize the Fast Go Compressor
-
-**Files:**
-- Modify: `internal/lz4block/block.go`
-- Test: `internal/lz4block/block_test.go`
-- Benchmark: `bench_test.go`, `internal/lz4block/bench_test.go`
-
-- [x] Profile the repaired block compressor benchmark with `pprof` and confirm the hot symbols still match the current profile.
-- [x] Experiment with simplifying `get`/`put` overhead:
-  - inline more aggressively if the compiler misses something
-  - reduce repeated mask/div/mod work
-  - try alternate entry layouts
-- [x] Benchmark whether a single-entry layout beats the current `table` plus `inUse` bitmap.
-- [x] Evaluate reducing little-endian load overhead in the match scan.
-- [x] Test whether a cheaper hash or a different `hashLog` improves throughput without unacceptable ratio loss.
-- [x] Add an early incompressible-block bailout heuristic and measure it on `random.data` plus mixed corpora.
-- [x] Keep output-format compatibility exact and verify with block round-trip tests and fuzz inputs.
-
-**Success criteria:**
-- At least one repaired block-compress benchmark improves measurably.
-- No regressions in `TestCompressUncompressBlock`, fuzz-style corpora, or ratio on the main text fixtures.
-
-## Task 3: Add Missing Checksum Assembly
-
-**Files:**
-- Modify/Create: `internal/xxh32/xxh32zero_amd64.s`
-- Modify/Create: `internal/xxh32/xxh32zero_amd64.go`
-- Consider: `internal/xxh32/xxh32zero_arm64.s`, `internal/xxh32/xxh32zero_arm64.go`
-- Test: `internal/xxh32/xxh32zero_test.go`
+**Files:** `internal/xxh32/xxh32zero_amd64.*`, optional `internal/xxh32/xxh32zero_arm64.*`, `internal/xxh32/xxh32zero_test.go`
 
 - [x] Implement `ChecksumZero` and `update` for `amd64` in Plan 9 assembly.
-- [x] Keep the Go fallback untouched for correctness and portability.
-- [x] Add focused benchmarks for `ChecksumZero` and streaming `update`.
-- [x] Re-run frame decode benchmarks with checksums enabled and disabled to isolate the win.
-- [x] If the `amd64` path is successful, decide whether an `arm64` port is worth doing immediately.
+- [x] Keep Go fallback paths for correctness and portability.
+- [x] Add focused `ChecksumZero` and streaming `update` benchmarks.
+- [x] Re-run frame decode benchmarks with checksums enabled and disabled.
+- [x] Decide whether to do `arm64` immediately.
 
-Decision: defer `arm64` for now. The `amd64` work is in place and verified, but the next highest-signal step is to measure broader frame-level wins before adding another architecture-specific assembly path.
+**Decision:** Defer `arm64`; first measure broader frame-level wins from the `amd64` path.
 
-**Why this is a good `asm` target:** it is small, isolated, already partially assembly-backed on ARM, and the stream profile already proves it matters.
+## Remaining Work
 
-## Task 4: Revisit Stream Concurrency
+### Task 4: Stream Concurrency
 
-**Files:**
-- Modify: `internal/lz4stream/block.go`
-- Modify: `writer.go`
-- Modify: `reader.go`
-- Benchmark: `bench_test.go`
+**Files:** `internal/lz4stream/block.go`, `writer.go`, `reader.go`, `bench_test.go`
 
-- [ ] Measure concurrent encode/decode with large blocks and multiple cores after Tasks 1-3.
-- [ ] Replace per-block goroutine creation with a reusable worker pool if scheduler overhead shows up.
-- [ ] Replace `chan chan *FrameDataBlock` and `chan chan []byte` orchestration with cheaper job/result queues if profiles justify it.
-- [ ] Preserve ordered output and first-error semantics.
-- [ ] Re-check memory retention and buffer-pool behavior after the refactor.
+- [x] Measure concurrent encode/decode with large blocks and multiple cores after Tasks 1-3.
+- [ ] If scheduler overhead shows up, replace per-block goroutine creation with a reusable worker pool.
+- [ ] If profiles justify it, replace nested channel orchestration with cheaper job/result queues.
+- [x] Preserve ordered output and first-error semantics.
+- [x] Re-check memory retention and buffer-pool behavior.
 
-**Success criteria:**
-- Better throughput at `ConcurrencyOption(n>1)` without increasing allocations or regressing single-threaded performance.
+**Task 4 note:** Fixed a concurrent writer reuse deadlock where `Reset` tried to close an already-drained concurrent block manager. Benchmarks now complete for concurrent frame compression. Current `benchmem`/profile results show higher allocation cost in concurrent paths, especially decompression, but not enough evidence for a broad worker-pool/channel rewrite in this pass.
 
-## Task 5: Decide Whether More Assembly Is Worth It
+**Success criteria:** Better throughput for `ConcurrencyOption(n>1)` without higher allocations or single-threaded regressions.
 
-**Files:**
-- Inspect: `internal/lz4block/block.go`
-- Inspect: `internal/lz4block/decode_amd64.s`
+### Task 5: More Assembly Decision
+
+**Files:** `internal/lz4block/block.go`, `internal/lz4block/decode_amd64.s`
 
 - [ ] Re-profile after Tasks 1-4.
-- [ ] If decoder assembly is no longer the bottleneck, leave it alone except for obvious threshold cleanups.
-- [ ] If compressor hot time is still concentrated in a tiny stable loop, prototype a narrow `amd64` assembly helper rather than rewriting the whole encoder.
-- [ ] Reject broad encoder assembly if the win is small or the maintenance cost is too high.
+- [ ] Leave decoder assembly alone unless measurements show a specific missed fast path.
+- [ ] If compressor time is still concentrated in a tiny stable loop, prototype a narrow `amd64` helper.
+- [ ] Reject broad encoder assembly unless repaired benchmarks show a large enough win to justify maintenance cost.
 
-**Decision rule:** do not write large compressor assembly until the repaired benchmarks and post-Go profiles prove that Go-level structural changes are exhausted.
+**Decision rule:** Do not write large compressor assembly until Go-level structural changes are exhausted and profiles prove it is worthwhile.
 
 ## Verification
 
-- [ ] Run:
-  - `go test ./...`
-  - `go test -run '^$' -bench . -benchmem`
-  - `go test -run '^$' -bench . -benchmem -tags noasm`
-- [ ] Compare compression ratio and throughput before vs after for:
-  - `pg1661`
-  - `Mark.Twain-Tom.Sawyer`
-  - `e.txt`
-  - `random.data`
-- [ ] Verify checksum-enabled frame decode still validates corrupted data correctly.
+- [ ] Run `go test ./...`.
+- [ ] Run `go test -run '^$' -bench . -benchmem`.
+- [ ] Run `go test -run '^$' -bench . -benchmem -tags noasm`.
+- [ ] Compare ratio and throughput on `pg1661`, `Mark.Twain-Tom.Sawyer`, `e.txt`, and `random.data`.
+- [ ] Verify checksum-enabled frame decode still rejects corrupted data.
 - [ ] Verify block and frame fuzz/regression tests still pass.
 
 ## Exit Criteria
 
-- The benchmark suite measures the real codec paths correctly.
-- Fast block compression is measurably faster on representative corpora.
+- Benchmarks measure real block/frame paths correctly.
+- Fast block compression is faster on representative corpora.
 - Checksum-enabled frame decode is faster on `amd64`.
-- Any new assembly has tests, `noasm` fallbacks, and clear benchmark justification.
-- The repo ends up with a repeatable measurement workflow, not just a one-off speed hack.
+- Any new assembly has tests, `noasm` fallbacks, and benchmark justification.
+- The repo has a repeatable measurement workflow for future performance work.

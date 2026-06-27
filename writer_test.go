@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cwbudde/lz4"
 	"github.com/cwbudde/lz4/internal/lz4block"
@@ -80,6 +81,56 @@ func TestWriter(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestWriterConcurrentMultipleBlocksCompletes(t *testing.T) {
+	raw, err := loadGoldenGz("testdata/pg1661.txt.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		var compressed bytes.Buffer
+		zw := lz4.NewWriter(&compressed)
+		if err := zw.Apply(lz4.BlockSizeOption(lz4.Block64Kb), lz4.ConcurrencyOption(4)); err != nil {
+			done <- err
+			return
+		}
+		for i := 0; i < 3; i++ {
+			compressed.Reset()
+			zw.Reset(&compressed)
+			if _, err := io.Copy(zw, bytes.NewReader(raw)); err != nil {
+				done <- err
+				return
+			}
+			if err := zw.Close(); err != nil {
+				done <- err
+				return
+			}
+
+			zr := lz4.NewReader(bytes.NewReader(compressed.Bytes()))
+			got, err := io.ReadAll(zr)
+			if err != nil {
+				done <- err
+				return
+			}
+			if !bytes.Equal(got, raw) {
+				done <- fmt.Errorf("round-trip mismatch: got %d bytes, want %d", len(got), len(raw))
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent writer did not complete")
 	}
 }
 

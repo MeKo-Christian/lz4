@@ -77,6 +77,7 @@ func (b *Blocks) close(f *Frame, num int) error {
 	<-c
 	err := b.err
 	b.err = nil
+	b.Blocks = nil
 	return err
 }
 
