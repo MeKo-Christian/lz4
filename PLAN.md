@@ -85,10 +85,12 @@
 
 **Files:** `internal/lz4block/block.go`, `internal/lz4block/decode_amd64.s`
 
-- [ ] Re-profile after Tasks 1-4.
-- [ ] Leave decoder assembly alone unless measurements show a specific missed fast path.
-- [ ] If compressor time is still concentrated in a tiny stable loop, prototype a narrow `amd64` helper.
-- [ ] Reject broad encoder assembly unless repaired benchmarks show a large enough win to justify maintenance cost.
+- [x] Re-profile after Tasks 1-4.
+- [x] Leave decoder assembly alone unless measurements show a specific missed fast path.
+- [x] If compressor time is still concentrated in a tiny stable loop, prototype a narrow `amd64` helper.
+- [x] Reject broad encoder assembly unless repaired benchmarks show a large enough win to justify maintenance cost.
+
+**Task 5 note:** Fresh `amd64` profiles still show block decompression dominated by the existing `decodeBlock` assembly, with `BenchmarkBlockDecompress` around `160 us/op` with assembly versus `499 us/op` with `-tags noasm`; no missed decoder fast path was isolated. Frame decode with checksums remains split between `decodeBlock` and `internal/xxh32.update` (`Pg1661ChecksumOn` profile: about 63% decode, 30% checksum), so additional decoder assembly is not the next lever. Fast block compression is still dominated by `internal/lz4block.(*Compressor).CompressBlock`, but line-level samples are spread across the Go hash/probe/match loop (`get`, `put`, `blockHash`, little-endian loads, and match extension) rather than a tiny stable helper. A narrow `amd64` helper is therefore not justified, and broad encoder assembly is rejected for this pass under the maintenance-cost decision rule.
 
 **Decision rule:** Do not write large compressor assembly until Go-level structural changes are exhausted and profiles prove it is worthwhile.
 
