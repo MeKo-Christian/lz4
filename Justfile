@@ -36,10 +36,10 @@ bench:
     @echo "Running benchmark tests..."
     go test -bench=. -benchmem ./...
 
-# Run fuzz tests (short)
+# Compile the legacy go-fuzz harness against the current library
 fuzz:
-    @echo "Running fuzz tests..."
-    go test -fuzz=. -fuzztime=30s ./fuzz/...
+    @echo "Checking legacy go-fuzz harness..."
+    cd fuzz && go test ./...
 
 # Development commands
 

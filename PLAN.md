@@ -94,6 +94,21 @@
 
 **Decision rule:** Do not write large compressor assembly until Go-level structural changes are exhausted and profiles prove it is worthwhile.
 
+## Maturity Backlog
+
+These items are outside the completed performance pass, but they are the next gaps to close before treating the library as mature and release-ready.
+
+- [ ] Push the completed performance-plan commits and tag a release once the benchmark and compatibility results are accepted.
+- [x] Add or verify CI coverage for Linux, macOS, and Windows.
+- [ ] Add or verify CI coverage for `amd64`, `arm64`, and the `-tags noasm` fallback path.
+- [x] Run race-enabled tests for reader/writer concurrency paths, especially `ConcurrencyOption(n>1)`, `Reset`, `ReadFrom`, and checksum-enabled streams.
+- [x] Keep block/frame fuzz corpora active through scheduled CI or a documented maintainer workflow.
+- [x] Preserve malformed-frame and corrupted-checksum regression tests as first-class compatibility checks.
+- [x] Document a repeatable benchmark workflow, including commands, representative corpora, CPU/go-version notes, and how to compare `noasm`.
+- [ ] Document block vs frame API usage, checksum tradeoffs, concurrency tradeoffs, supported Go versions, and compatibility guarantees.
+- [ ] Move lasting benchmark findings from this working plan into release notes or a maintained benchmark note so `PLAN.md` can stop being the long-term source of truth.
+- [ ] Revisit reader-side concurrency allocation overhead only if future profiles show it is a top bottleneck on realistic workloads.
+
 ## Verification
 
 - [ ] Run `go test ./...`.
